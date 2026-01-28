@@ -18,8 +18,6 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Service using official OpenAI Java SDK for API calls
@@ -41,11 +39,7 @@ public class OpenAISdkService {
         this.metricsService = metricsService;
     }
 
-    /**
-     * Create OpenAI client with specific API key
-     */
     private OpenAIClient createClient(String apiKey) {
-        log.debug("Creating OpenAI client with baseUrl: {}, apiKey: {}", baseUrl, apiKey.substring(0, Math.min(15, apiKey.length())) + "...");
         return OpenAIOkHttpClient.builder()
                 .baseUrl(baseUrl)
                 .apiKey(apiKey)
@@ -60,11 +54,7 @@ public class OpenAISdkService {
             OpenAIClient client = createClient(apiKey);
             ChatCompletionCreateParams params = buildChatCompletionParams(anthropicRequest);
             
-            log.debug("Sending non-streaming request to OpenAI API for user: {}", userId);
-            
             ChatCompletion completion = client.chat().completions().create(params);
-            
-            // Record metrics
             metricsService.recordSdkResponse(userId, completion);
             
             return convertToAnthropicResponse(completion, anthropicRequest.getModel());
@@ -77,497 +67,404 @@ public class OpenAISdkService {
     public Flux<String> sendStreamingRequest(AnthropicRequest anthropicRequest, String userId, String apiKey) {
         return Flux.<String>create(sink -> {
             try {
-                log.debug("Creating client for streaming request, userId: {}, apiKey: {}", userId, apiKey.substring(0, Math.min(15, apiKey.length())) + "...");
                 OpenAIClient client = createClient(apiKey);
                 ChatCompletionCreateParams params = buildChatCompletionParams(anthropicRequest);
                 
                 String requestModel = anthropicRequest.getModel();
                 String messageId = "msg_" + UUID.randomUUID().toString().replace("-", "");
-                
-                log.debug("Sending streaming request to OpenAI API for user: {}", userId);
 
-                // State tracking for stream conversion
-                AtomicReference<StringBuilder> currentToolArgs = new AtomicReference<>(new StringBuilder());
-                AtomicReference<String> currentToolName = new AtomicReference<>();
-                AtomicReference<String> currentToolId = new AtomicReference<>();
-                AtomicInteger currentToolIndex = new AtomicInteger(-1);
-                AtomicInteger contentBlockIndex = new AtomicInteger(0);
-                AtomicReference<Boolean> messageStartSent = new AtomicReference<>(false);
-                AtomicReference<Boolean> textBlockStarted = new AtomicReference<>(false);
-                AtomicReference<List<ToolCallInfo>> collectedToolCalls = new AtomicReference<>(new ArrayList<>());
+                // Stream state
+                StringBuilder currentToolArgs = new StringBuilder();
+                String[] currentToolName = {null};
+                String[] currentToolId = {null};
+                int[] currentToolIndex = {-1};
+                int[] contentBlockIndex = {0};
+                boolean[] messageStartSent = {false};
+                boolean[] textBlockStarted = {false};
+                List<ToolCallInfo> collectedToolCalls = new ArrayList<>();
 
-                try (StreamResponse<ChatCompletionChunk> streamResponse = 
+                try (StreamResponse<ChatCompletionChunk> stream = 
                         client.chat().completions().createStreaming(params)) {
                     
-                    streamResponse.stream().forEach(chunk -> {
+                    stream.stream().forEach(chunk -> {
                         List<String> events = new ArrayList<>();
 
                         // Send message_start on first chunk
-                        if (!messageStartSent.getAndSet(true)) {
-                            Map<String, Object> messageData = new HashMap<>();
-                            messageData.put("id", messageId);
-                            messageData.put("type", "message");
-                            messageData.put("role", "assistant");
-                            messageData.put("content", List.of());
-                            messageData.put("model", requestModel != null ? requestModel : "unknown");
-                            messageData.put("stop_reason", null);
-                            messageData.put("stop_sequence", null);
-                            messageData.put("usage", Map.of("input_tokens", 0, "output_tokens", 0));
-                            
-                            Map<String, Object> startEvent = new HashMap<>();
-                            startEvent.put("type", "message_start");
-                            startEvent.put("message", messageData);
-                            events.add(formatSSE(startEvent));
+                        if (!messageStartSent[0]) {
+                            messageStartSent[0] = true;
+                            events.add(formatSSE(Map.of(
+                                "type", "message_start",
+                                "message", createMessageStartData(messageId, requestModel)
+                            )));
                         }
 
-                        List<ChatCompletionChunk.Choice> choices = chunk.choices();
-                        if (choices != null && !choices.isEmpty()) {
-                            ChatCompletionChunk.Choice choice = choices.get(0);
-                            ChatCompletionChunk.Choice.Delta delta = choice.delta();
+                        if (chunk.choices().isEmpty()) return;
+                        
+                        ChatCompletionChunk.Choice choice = chunk.choices().get(0);
+                        ChatCompletionChunk.Choice.Delta delta = choice.delta();
 
-                            if (delta != null) {
-                                // Handle text content
-                                Optional<String> contentOpt = delta.content();
-                                if (contentOpt.isPresent() && !contentOpt.get().isEmpty()) {
-                                    String content = contentOpt.get();
-                                    if (!textBlockStarted.getAndSet(true)) {
-                                        events.add(formatSSE(Map.of(
-                                                "type", "content_block_start",
-                                                "index", contentBlockIndex.getAndIncrement(),
-                                                "content_block", Map.of("type", "text", "text", "")
-                                        )));
-                                    }
-                                    events.add(formatSSE(Map.of(
-                                            "type", "content_block_delta",
-                                            "index", contentBlockIndex.get() - 1,
-                                            "delta", Map.of("type", "text_delta", "text", content)
-                                    )));
-                                }
+                        // Handle text content
+                        delta.content().filter(c -> !c.isEmpty()).ifPresent(content -> {
+                            if (!textBlockStarted[0]) {
+                                textBlockStarted[0] = true;
+                                events.add(formatSSE(Map.of(
+                                    "type", "content_block_start",
+                                    "index", contentBlockIndex[0]++,
+                                    "content_block", Map.of("type", "text", "text", "")
+                                )));
+                            }
+                            events.add(formatSSE(Map.of(
+                                "type", "content_block_delta",
+                                "index", contentBlockIndex[0] - 1,
+                                "delta", Map.of("type", "text_delta", "text", content)
+                            )));
+                        });
 
-                                // Handle tool calls
-                                Optional<List<ChatCompletionChunk.Choice.Delta.ToolCall>> toolCallsOpt = delta.toolCalls();
-                                if (toolCallsOpt.isPresent()) {
-                                    List<ChatCompletionChunk.Choice.Delta.ToolCall> toolCalls = toolCallsOpt.get();
-                                    for (ChatCompletionChunk.Choice.Delta.ToolCall toolCall : toolCalls) {
-                                        int toolIdx = (int) toolCall.index();
-                                        
-                                        // New tool call starting
-                                        Optional<String> idOpt = toolCall.id();
-                                        if (idOpt.isPresent() && toolIdx != currentToolIndex.get()) {
-                                            // Close previous text block if open
-                                            if (textBlockStarted.get()) {
-                                                events.add(formatSSE(Map.of(
-                                                        "type", "content_block_stop",
-                                                        "index", contentBlockIndex.get() - 1
-                                                )));
-                                                textBlockStarted.set(false);
-                                            }
-                                            
-                                            // Close previous tool call if any
-                                            if (currentToolIndex.get() >= 0 && currentToolId.get() != null) {
-                                                // Save previous tool call info
-                                                collectedToolCalls.get().add(new ToolCallInfo(
-                                                        currentToolId.get(),
-                                                        currentToolName.get(),
-                                                        currentToolArgs.get().toString()
-                                                ));
-                                                
-                                                events.add(formatSSE(Map.of(
-                                                        "type", "content_block_stop",
-                                                        "index", contentBlockIndex.get() - 1
-                                                )));
-                                            }
-                                            
-                                            currentToolIndex.set(toolIdx);
-                                            currentToolId.set(idOpt.get());
-                                            
-                                            Optional<ChatCompletionChunk.Choice.Delta.ToolCall.Function> funcOpt = toolCall.function();
-                                            String funcName = funcOpt.flatMap(ChatCompletionChunk.Choice.Delta.ToolCall.Function::name).orElse("");
-                                            currentToolName.set(funcName);
-                                            currentToolArgs.set(new StringBuilder());
-                                            
-                                            // Send content_block_start for tool_use
+                        // Handle tool calls
+                        delta.toolCalls().ifPresent(toolCalls -> {
+                            for (var toolCall : toolCalls) {
+                                int toolIdx = (int) toolCall.index();
+                                
+                                // New tool call starting
+                                toolCall.id().ifPresent(id -> {
+                                    if (toolIdx != currentToolIndex[0]) {
+                                        // Close previous text block
+                                        if (textBlockStarted[0]) {
                                             events.add(formatSSE(Map.of(
-                                                    "type", "content_block_start",
-                                                    "index", contentBlockIndex.getAndIncrement(),
-                                                    "content_block", Map.of(
-                                                            "type", "tool_use",
-                                                            "id", currentToolId.get(),
-                                                            "name", currentToolName.get(),
-                                                            "input", Map.of()
-                                                    )
+                                                "type", "content_block_stop",
+                                                "index", contentBlockIndex[0] - 1
+                                            )));
+                                            textBlockStarted[0] = false;
+                                        }
+                                        
+                                        // Save previous tool call
+                                        if (currentToolIndex[0] >= 0 && currentToolId[0] != null) {
+                                            collectedToolCalls.add(new ToolCallInfo(
+                                                currentToolId[0], currentToolName[0], currentToolArgs.toString()));
+                                            events.add(formatSSE(Map.of(
+                                                "type", "content_block_stop",
+                                                "index", contentBlockIndex[0] - 1
                                             )));
                                         }
                                         
-                                        // Accumulate tool arguments
-                                        Optional<ChatCompletionChunk.Choice.Delta.ToolCall.Function> funcOpt = toolCall.function();
-                                        if (funcOpt.isPresent()) {
-                                            Optional<String> argsOpt = funcOpt.get().arguments();
-                                            if (argsOpt.isPresent()) {
-                                                String args = argsOpt.get();
-                                                currentToolArgs.get().append(args);
-                                                events.add(formatSSE(Map.of(
-                                                        "type", "content_block_delta",
-                                                        "index", contentBlockIndex.get() - 1,
-                                                        "delta", Map.of("type", "input_json_delta", "partial_json", args)
-                                                )));
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Handle finish reason
-                                Optional<ChatCompletionChunk.Choice.FinishReason> finishReasonOpt = choice.finishReason();
-                                if (finishReasonOpt.isPresent()) {
-                                    // Save last tool call if any
-                                    if (currentToolIndex.get() >= 0 && currentToolId.get() != null) {
-                                        collectedToolCalls.get().add(new ToolCallInfo(
-                                                currentToolId.get(),
-                                                currentToolName.get(),
-                                                currentToolArgs.get().toString()
-                                        ));
+                                        currentToolIndex[0] = toolIdx;
+                                        currentToolId[0] = id;
+                                        currentToolName[0] = toolCall.function()
+                                            .flatMap(ChatCompletionChunk.Choice.Delta.ToolCall.Function::name)
+                                            .orElse("");
+                                        currentToolArgs.setLength(0);
                                         
                                         events.add(formatSSE(Map.of(
-                                                "type", "content_block_stop",
-                                                "index", contentBlockIndex.get() - 1
+                                            "type", "content_block_start",
+                                            "index", contentBlockIndex[0]++,
+                                            "content_block", Map.of(
+                                                "type", "tool_use",
+                                                "id", currentToolId[0],
+                                                "name", currentToolName[0],
+                                                "input", Map.of()
+                                            )
                                         )));
-                                        currentToolIndex.set(-1);
                                     }
-                                }
+                                });
+                                
+                                // Accumulate tool arguments
+                                toolCall.function().flatMap(f -> f.arguments()).ifPresent(args -> {
+                                    currentToolArgs.append(args);
+                                    events.add(formatSSE(Map.of(
+                                        "type", "content_block_delta",
+                                        "index", contentBlockIndex[0] - 1,
+                                        "delta", Map.of("type", "input_json_delta", "partial_json", args)
+                                    )));
+                                });
                             }
-                        }
+                        });
 
-                        // Emit all events
-                        for (String event : events) {
-                            sink.next(event);
-                        }
+                        // Handle finish reason
+                        choice.finishReason().ifPresent(reason -> {
+                            if (currentToolIndex[0] >= 0 && currentToolId[0] != null) {
+                                collectedToolCalls.add(new ToolCallInfo(
+                                    currentToolId[0], currentToolName[0], currentToolArgs.toString()));
+                                events.add(formatSSE(Map.of(
+                                    "type", "content_block_stop",
+                                    "index", contentBlockIndex[0] - 1
+                                )));
+                                currentToolIndex[0] = -1;
+                            }
+                        });
+
+                        events.forEach(sink::next);
                     });
 
-                    // Send final events
-                    if (textBlockStarted.get()) {
+                    // Final events
+                    if (textBlockStarted[0]) {
                         sink.next(formatSSE(Map.of(
-                                "type", "content_block_stop",
-                                "index", contentBlockIndex.get() - 1
+                            "type", "content_block_stop",
+                            "index", contentBlockIndex[0] - 1
                         )));
                     }
                     
-                    // Build message_delta with nullable stop_sequence
                     Map<String, Object> deltaContent = new HashMap<>();
                     deltaContent.put("stop_reason", "end_turn");
                     deltaContent.put("stop_sequence", null);
                     
-                    Map<String, Object> messageDelta = new HashMap<>();
-                    messageDelta.put("type", "message_delta");
-                    messageDelta.put("delta", deltaContent);
-                    messageDelta.put("usage", Map.of("output_tokens", 0));
-                    
-                    sink.next(formatSSE(messageDelta));
+                    sink.next(formatSSE(Map.of(
+                        "type", "message_delta",
+                        "delta", deltaContent,
+                        "usage", Map.of("output_tokens", 0)
+                    )));
                     sink.next(formatSSE(Map.of("type", "message_stop")));
                     
-                    // Record metrics
-                    metricsService.recordStreamingToolCalls(userId, collectedToolCalls.get());
-                    
+                    metricsService.recordStreamingToolCalls(userId, collectedToolCalls);
                     sink.complete();
                 }
             } catch (Exception e) {
-                log.error("Error during streaming request: {}", e.getMessage(), e);
+                log.error("Error during streaming: {}", e.getMessage(), e);
                 sink.error(e);
             }
         }, reactor.core.publisher.FluxSink.OverflowStrategy.BUFFER)
         .subscribeOn(Schedulers.boundedElastic());
     }
 
-    /**
-     * Build ChatCompletionCreateParams from AnthropicRequest
-     */
-    private ChatCompletionCreateParams buildChatCompletionParams(AnthropicRequest anthropicRequest) {
-        ChatCompletionCreateParams.Builder builder = ChatCompletionCreateParams.builder()
-                .model(anthropicRequest.getModel());
+    private Map<String, Object> createMessageStartData(String messageId, String model) {
+        Map<String, Object> data = new HashMap<>();
+        data.put("id", messageId);
+        data.put("type", "message");
+        data.put("role", "assistant");
+        data.put("content", List.of());
+        data.put("model", model != null ? model : "unknown");
+        data.put("stop_reason", null);
+        data.put("stop_sequence", null);
+        data.put("usage", Map.of("input_tokens", 0, "output_tokens", 0));
+        return data;
+    }
 
-        // Add system message if present
-        String systemText = extractSystemText(anthropicRequest.getSystem());
+    private ChatCompletionCreateParams buildChatCompletionParams(AnthropicRequest request) {
+        ChatCompletionCreateParams.Builder builder = ChatCompletionCreateParams.builder()
+                .model(request.getModel());
+
+        // System message
+        String systemText = extractSystemText(request.getSystem());
         if (systemText != null && !systemText.isEmpty()) {
             builder.addSystemMessage(systemText);
         }
 
-        // Convert messages
-        if (anthropicRequest.getMessages() != null) {
-            for (AnthropicMessage msg : anthropicRequest.getMessages()) {
+        // Messages
+        if (request.getMessages() != null) {
+            for (AnthropicMessage msg : request.getMessages()) {
                 addMessage(builder, msg);
             }
         }
 
-        // Set optional parameters
-        if (anthropicRequest.getMaxTokens() != null) {
-            builder.maxTokens(anthropicRequest.getMaxTokens().longValue());
+        // Optional parameters
+        if (request.getMaxTokens() != null) {
+            builder.maxTokens(request.getMaxTokens().longValue());
         }
-        if (anthropicRequest.getTemperature() != null) {
-            builder.temperature(anthropicRequest.getTemperature());
+        if (request.getTemperature() != null) {
+            builder.temperature(request.getTemperature());
         }
-        if (anthropicRequest.getTopP() != null) {
-            builder.topP(anthropicRequest.getTopP());
+        if (request.getTopP() != null) {
+            builder.topP(request.getTopP());
         }
-        if (anthropicRequest.getStopSequences() != null && !anthropicRequest.getStopSequences().isEmpty()) {
-            builder.stop(ChatCompletionCreateParams.Stop.ofStrings(anthropicRequest.getStopSequences()));
+        if (request.getStopSequences() != null && !request.getStopSequences().isEmpty()) {
+            builder.stop(ChatCompletionCreateParams.Stop.ofStrings(request.getStopSequences()));
         }
 
-        // Convert tools
-        if (anthropicRequest.getTools() != null && !anthropicRequest.getTools().isEmpty()) {
-            for (AnthropicTool tool : anthropicRequest.getTools()) {
-                ChatCompletionFunctionTool functionTool = ChatCompletionFunctionTool.builder()
+        // Tools
+        if (request.getTools() != null && !request.getTools().isEmpty()) {
+            for (AnthropicTool tool : request.getTools()) {
+                builder.addTool(ChatCompletionTool.ofFunction(
+                    ChatCompletionFunctionTool.builder()
                         .function(FunctionDefinition.builder()
-                                .name(tool.getName())
-                                .description(tool.getDescription() != null ? tool.getDescription() : "")
-                                .parameters(FunctionParameters.builder()
-                                        .putAllAdditionalProperties(tool.getInputSchema() != null ? 
-                                                convertToJsonValueMap(tool.getInputSchema()) : Map.of())
-                                        .build())
+                            .name(tool.getName())
+                            .description(tool.getDescription() != null ? tool.getDescription() : "")
+                            .parameters(FunctionParameters.builder()
+                                .putAllAdditionalProperties(tool.getInputSchema() != null ? 
+                                    convertToJsonValueMap(tool.getInputSchema()) : Map.of())
                                 .build())
-                        .build();
-                builder.addTool(ChatCompletionTool.ofFunction(functionTool));
+                            .build())
+                        .build()
+                ));
             }
         }
 
         return builder.build();
     }
 
-    /**
-     * Add message to builder
-     */
     private void addMessage(ChatCompletionCreateParams.Builder builder, AnthropicMessage msg) {
         Object content = msg.getContent();
         String role = msg.getRole();
 
-        if (content instanceof String) {
+        if (content instanceof String text) {
             if ("user".equals(role)) {
-                builder.addUserMessage((String) content);
+                builder.addUserMessage(text);
             } else if ("assistant".equals(role)) {
-                builder.addAssistantMessage((String) content);
+                builder.addAssistantMessage(text);
             }
-        } else if (content instanceof List) {
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> contentList = (List<Map<String, Object>>) content;
-            
-            StringBuilder textContent = new StringBuilder();
-            List<ChatCompletionMessageToolCall> toolCalls = new ArrayList<>();
-            
-            for (Map<String, Object> item : contentList) {
-                String type = (String) item.get("type");
-                
-                if ("text".equals(type)) {
-                    textContent.append(item.get("text"));
-                } else if ("tool_use".equals(type)) {
-                    String id = (String) item.get("id");
-                    String name = (String) item.get("name");
-                    Object input = item.get("input");
+        } else if (content instanceof List<?> contentList) {
+            processContentList(builder, role, contentList);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void processContentList(ChatCompletionCreateParams.Builder builder, String role, List<?> contentList) {
+        StringBuilder textContent = new StringBuilder();
+        List<ChatCompletionMessageToolCall> toolCalls = new ArrayList<>();
+
+        for (Object item : contentList) {
+            if (!(item instanceof Map)) continue;
+            Map<String, Object> itemMap = (Map<String, Object>) item;
+            String type = (String) itemMap.get("type");
+
+            switch (type) {
+                case "text" -> textContent.append(itemMap.get("text"));
+                case "tool_use" -> {
                     String arguments;
                     try {
-                        arguments = objectMapper.writeValueAsString(input);
+                        arguments = objectMapper.writeValueAsString(itemMap.get("input"));
                     } catch (JsonProcessingException e) {
                         arguments = "{}";
                     }
-                    
-                    // Build function tool call
-                    ChatCompletionMessageFunctionToolCall functionToolCall = 
-                            ChatCompletionMessageFunctionToolCall.builder()
-                                    .id(id)
-                                    .function(ChatCompletionMessageFunctionToolCall.Function.builder()
-                                            .name(name)
-                                            .arguments(arguments)
-                                            .build())
-                                    .build();
-                    toolCalls.add(ChatCompletionMessageToolCall.ofFunction(functionToolCall));
-                } else if ("tool_result".equals(type)) {
-                    String toolUseId = (String) item.get("tool_use_id");
-                    Object resultContent = item.get("content");
-                    String toolResultText;
-                    
-                    if (resultContent instanceof String) {
-                        toolResultText = (String) resultContent;
-                    } else {
-                        try {
-                            toolResultText = objectMapper.writeValueAsString(resultContent);
-                        } catch (JsonProcessingException e) {
-                            toolResultText = "";
-                        }
-                    }
-                    
+                    toolCalls.add(ChatCompletionMessageToolCall.ofFunction(
+                        ChatCompletionMessageFunctionToolCall.builder()
+                            .id((String) itemMap.get("id"))
+                            .function(ChatCompletionMessageFunctionToolCall.Function.builder()
+                                .name((String) itemMap.get("name"))
+                                .arguments(arguments)
+                                .build())
+                            .build()
+                    ));
+                }
+                case "tool_result" -> {
+                    Object resultContent = itemMap.get("content");
+                    String toolResultText = resultContent instanceof String ? 
+                        (String) resultContent : serializeToJson(resultContent);
                     builder.addMessage(ChatCompletionToolMessageParam.builder()
-                            .toolCallId(toolUseId)
-                            .content(toolResultText)
-                            .build());
+                        .toolCallId((String) itemMap.get("tool_use_id"))
+                        .content(toolResultText)
+                        .build());
                 }
             }
-            
-            // Add text or assistant message with tool calls
-            if (!textContent.isEmpty() || !toolCalls.isEmpty()) {
-                if ("user".equals(role)) {
-                    builder.addUserMessage(textContent.toString());
-                } else if ("assistant".equals(role)) {
-                    if (toolCalls.isEmpty()) {
-                        builder.addAssistantMessage(textContent.toString());
-                    } else {
-                        builder.addMessage(ChatCompletionAssistantMessageParam.builder()
-                                .content(textContent.toString())
-                                .toolCalls(toolCalls)
-                                .build());
-                    }
+        }
+
+        if (!textContent.isEmpty() || !toolCalls.isEmpty()) {
+            if ("user".equals(role)) {
+                builder.addUserMessage(textContent.toString());
+            } else if ("assistant".equals(role)) {
+                if (toolCalls.isEmpty()) {
+                    builder.addAssistantMessage(textContent.toString());
+                } else {
+                    builder.addMessage(ChatCompletionAssistantMessageParam.builder()
+                        .content(textContent.toString())
+                        .toolCalls(toolCalls)
+                        .build());
                 }
             }
         }
     }
 
-    /**
-     * Convert ChatCompletion to AnthropicResponse
-     */
     private AnthropicResponse convertToAnthropicResponse(ChatCompletion completion, String requestModel) {
-        List<ChatCompletion.Choice> choices = completion.choices();
-        if (choices.isEmpty()) {
-            return null;
-        }
+        if (completion.choices().isEmpty()) return null;
 
-        ChatCompletion.Choice choice = choices.get(0);
+        ChatCompletion.Choice choice = completion.choices().get(0);
         ChatCompletionMessage message = choice.message();
-
         List<AnthropicContent> content = new ArrayList<>();
 
-        // Convert text content
-        Optional<String> textContentOpt = message.content();
-        if (textContentOpt.isPresent() && !textContentOpt.get().isEmpty()) {
-            content.add(AnthropicContent.builder()
-                    .type("text")
-                    .text(textContentOpt.get())
-                    .build());
-        }
+        // Text content
+        message.content().filter(c -> !c.isEmpty()).ifPresent(text ->
+            content.add(AnthropicContent.builder().type("text").text(text).build())
+        );
 
-        // Convert tool calls
-        Optional<List<ChatCompletionMessageToolCall>> toolCallsOpt = message.toolCalls();
-        if (toolCallsOpt.isPresent()) {
-            List<ChatCompletionMessageToolCall> toolCalls = toolCallsOpt.get();
-            for (ChatCompletionMessageToolCall toolCall : toolCalls) {
-                // Use function() to get the function tool call
-                Optional<ChatCompletionMessageFunctionToolCall> funcToolCallOpt = toolCall.function();
-                if (funcToolCallOpt.isPresent()) {
-                    ChatCompletionMessageFunctionToolCall funcToolCall = funcToolCallOpt.get();
-                    
+        // Tool calls
+        message.toolCalls().ifPresent(toolCalls -> {
+            for (var toolCall : toolCalls) {
+                toolCall.function().ifPresent(func -> {
                     Object input;
                     try {
-                        input = objectMapper.readValue(funcToolCall.function().arguments(), Map.class);
+                        input = objectMapper.readValue(func.function().arguments(), Map.class);
                     } catch (JsonProcessingException e) {
                         input = Map.of();
                     }
-
                     content.add(AnthropicContent.builder()
-                            .type("tool_use")
-                            .id(funcToolCall.id())
-                            .name(funcToolCall.function().name())
-                            .input(input)
-                            .build());
-                }
+                        .type("tool_use")
+                        .id(func.id())
+                        .name(func.function().name())
+                        .input(input)
+                        .build());
+                });
             }
-        }
+        });
 
-        // Convert stop reason
-        String stopReason = convertFinishReasonToStopReason(choice.finishReason());
-
-        // Convert usage
-        AnthropicUsage usage = null;
-        Optional<CompletionUsage> usageOpt = completion.usage();
-        if (usageOpt.isPresent()) {
-            CompletionUsage u = usageOpt.get();
-            usage = AnthropicUsage.builder()
-                    .inputTokens((int) u.promptTokens())
-                    .outputTokens((int) u.completionTokens())
-                    .build();
-        }
+        AnthropicUsage usage = completion.usage().map(u -> 
+            AnthropicUsage.builder()
+                .inputTokens((int) u.promptTokens())
+                .outputTokens((int) u.completionTokens())
+                .build()
+        ).orElse(null);
 
         return AnthropicResponse.builder()
-                .id(completion.id())
-                .type("message")
-                .role("assistant")
-                .content(content)
-                .model(requestModel)
-                .stopReason(stopReason)
-                .usage(usage)
-                .build();
+            .id(completion.id())
+            .type("message")
+            .role("assistant")
+            .content(content)
+            .model(requestModel)
+            .stopReason(convertFinishReason(choice.finishReason()))
+            .usage(usage)
+            .build();
     }
 
-    /**
-     * Convert OpenAI finish_reason to Anthropic stop_reason
-     */
-    private String convertFinishReasonToStopReason(ChatCompletion.Choice.FinishReason finishReason) {
-        if (finishReason == null) {
-            return "end_turn";
-        }
-        
-        String reasonStr = finishReason.toString();
-        if (reasonStr.contains("STOP") || reasonStr.contains("stop")) {
-            return "end_turn";
-        } else if (reasonStr.contains("LENGTH") || reasonStr.contains("length")) {
-            return "max_tokens";
-        } else if (reasonStr.contains("TOOL") || reasonStr.contains("tool")) {
-            return "tool_use";
-        } else if (reasonStr.contains("CONTENT_FILTER") || reasonStr.contains("content_filter")) {
-            return "end_turn";
-        }
+    private String convertFinishReason(ChatCompletion.Choice.FinishReason reason) {
+        if (reason == null) return "end_turn";
+        String str = reason.toString().toLowerCase();
+        if (str.contains("stop")) return "end_turn";
+        if (str.contains("length")) return "max_tokens";
+        if (str.contains("tool")) return "tool_use";
         return "end_turn";
     }
 
-    /**
-     * Convert Map to JsonValue map for SDK
-     */
-    @SuppressWarnings("unchecked")
     private Map<String, com.openai.core.JsonValue> convertToJsonValueMap(Map<String, Object> map) {
         Map<String, com.openai.core.JsonValue> result = new HashMap<>();
-        for (Map.Entry<String, Object> entry : map.entrySet()) {
+        for (var entry : map.entrySet()) {
             result.put(entry.getKey(), com.openai.core.JsonValue.from(entry.getValue()));
         }
         return result;
     }
 
-    /**
-     * Extract system prompt text from Object (can be String or List of content blocks)
-     */
     @SuppressWarnings("unchecked")
     private String extractSystemText(Object system) {
-        if (system == null) {
-            return null;
-        }
-        if (system instanceof String) {
-            return (String) system;
-        }
-        if (system instanceof List) {
-            List<?> blocks = (List<?>) system;
+        if (system == null) return null;
+        if (system instanceof String s) return s;
+        if (system instanceof List<?> blocks) {
             StringBuilder sb = new StringBuilder();
             for (Object block : blocks) {
-                if (block instanceof Map) {
-                    Map<String, Object> map = (Map<String, Object>) block;
-                    Object text = map.get("text");
+                if (block instanceof Map<?, ?> map) {
+                    Object text = ((Map<String, Object>) map).get("text");
                     if (text != null) {
-                        if (sb.length() > 0) sb.append("\n");
-                        sb.append(text.toString());
+                        if (!sb.isEmpty()) sb.append("\n");
+                        sb.append(text);
                     }
                 }
             }
-            return sb.length() > 0 ? sb.toString() : null;
+            return sb.isEmpty() ? null : sb.toString();
         }
         return system.toString();
     }
 
-    /**
-     * Format data as SSE event
-     */
     private String formatSSE(Map<String, Object> data) {
         try {
             return "event: " + data.get("type") + "\ndata: " + objectMapper.writeValueAsString(data) + "\n\n";
         } catch (JsonProcessingException e) {
-            log.error("Failed to serialize SSE data: {}", e.getMessage());
+            log.error("Failed to serialize SSE: {}", e.getMessage());
             return "";
         }
     }
 
-    /**
-     * Simple class to hold tool call info for metrics
-     */
+    private String serializeToJson(Object obj) {
+        try {
+            return objectMapper.writeValueAsString(obj);
+        } catch (JsonProcessingException e) {
+            return "";
+        }
+    }
+
     public record ToolCallInfo(String id, String name, String arguments) {}
 }

@@ -61,13 +61,12 @@ public class AnthropicProxyController {
         }
 
         // Handle streaming vs non-streaming
-//        if (Boolean.TRUE.equals(request.getStream())) {
-        handleStreamingRequest(request, userId, apiKey, httpResponse);
-        return null;
-//            return null; // Response already written
-//        } else {
-//            return handleNonStreamingRequest(request, userId, apiKey);
-//        }
+        if (Boolean.TRUE.equals(request.getStream())) {
+            handleStreamingRequest(request, userId, apiKey, httpResponse);
+            return null;
+        } else {
+            return handleNonStreamingRequest(request, userId, apiKey);
+        }
     }
 
     /**
