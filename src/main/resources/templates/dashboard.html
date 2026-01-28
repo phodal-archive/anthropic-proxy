@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Code Metrics Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .card {
+            @apply bg-white rounded-lg shadow-md p-6;
+        }
+        .stat-value {
+            @apply text-3xl font-bold text-gray-800;
+        }
+        .stat-label {
+            @apply text-sm text-gray-500 uppercase tracking-wide;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <header class="mb-8">
+            <h1 class="text-4xl font-bold text-gray-800">Claude Code Metrics Dashboard</h1>
+            <p class="text-gray-600 mt-2">Real-time observability for Claude Code usage</p>
+        </header>
+
+        <!-- Summary Stats -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+            <div class="card">
+                <div class="stat-label">Total Requests</div>
+                <div class="stat-value" th:text="${totalRequests}">0</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Total Tool Calls</div>
+                <div class="stat-value" th:text="${totalToolCalls}">0</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Edit Tool Calls</div>
+                <div class="stat-value text-blue-600" th:text="${totalEditToolCalls}">0</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Lines Modified</div>
+                <div class="stat-value text-green-600" th:text="${totalLinesModified}">0</div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+            <div class="card">
+                <div class="stat-label">Input Tokens</div>
+                <div class="stat-value text-purple-600" th:text="${totalInputTokens}">0</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Output Tokens</div>
+                <div class="stat-value text-orange-600" th:text="${totalOutputTokens}">0</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Active Users</div>
+                <div class="stat-value text-indigo-600" th:text="${activeUsers}">0</div>
+            </div>
+            <div class="card">
+                <div class="stat-label">Avg Tool Calls/Request</div>
+                <div class="stat-value" th:text="${totalRequests > 0 ? #numbers.formatDecimal(totalToolCalls / totalRequests, 1, 2) : '0'}">0</div>
+            </div>
+        </div>
+
+        <!-- Charts Row -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+            <!-- Tool Calls Chart -->
+            <div class="card">
+                <h2 class="text-xl font-semibold mb-4">Tool Calls Distribution</h2>
+                <canvas id="toolCallsChart" height="300"></canvas>
+            </div>
+            
+            <!-- User Activity Chart -->
+            <div class="card">
+                <h2 class="text-xl font-semibold mb-4">User Activity</h2>
+                <canvas id="userActivityChart" height="300"></canvas>
+            </div>
+        </div>
+
+        <!-- User Metrics Table -->
+        <div class="card mb-8">
+            <h2 class="text-xl font-semibold mb-4">User Metrics</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User ID</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Requests</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tool Calls</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Edit Tools</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Lines Modified</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Input Tokens</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Output Tokens</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Seen</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <tr th:each="user : ${userMetrics}">
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" th:text="${user.userId}">-</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" th:text="${user.totalRequests}">0</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" th:text="${user.totalToolCalls}">0</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-blue-600" th:text="${user.editToolCalls}">0</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-green-600" th:text="${user.linesModified}">0</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-purple-600" th:text="${user.inputTokens}">0</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-orange-600" th:text="${user.outputTokens}">0</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" th:text="${user.lastSeen}">-</td>
+                        </tr>
+                        <tr th:if="${#lists.isEmpty(userMetrics)}">
+                            <td colspan="8" class="px-6 py-4 text-center text-gray-500">No user data yet</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Recent Requests Table -->
+        <div class="card">
+            <h2 class="text-xl font-semibold mb-4">Recent Requests</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Timestamp</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User ID</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Model</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Has Tools</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tool Count</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-gray-200">
+                        <tr th:each="req : ${recentRequests}">
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" th:text="${req.timestamp}">-</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" th:text="${req.userId}">-</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" th:text="${req.model}">-</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm">
+                                <span th:if="${req.hasTools}" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">Yes</span>
+                                <span th:unless="${req.hasTools}" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-100 text-gray-800">No</span>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" th:text="${req.toolCount}">0</td>
+                        </tr>
+                        <tr th:if="${#lists.isEmpty(recentRequests)}">
+                            <td colspan="5" class="px-6 py-4 text-center text-gray-500">No requests yet</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script th:inline="javascript">
+        // Tool calls data from server
+        const toolCallsData = /*[[${toolCallsByName}]]*/ {};
+        
+        // User metrics data
+        const userMetrics = /*[[${userMetrics}]]*/ [];
+        
+        // Initialize tool calls chart
+        const toolCallsCtx = document.getElementById('toolCallsChart').getContext('2d');
+        const toolLabels = Object.keys(toolCallsData);
+        const toolValues = Object.values(toolCallsData);
+        
+        new Chart(toolCallsCtx, {
+            type: 'bar',
+            data: {
+                labels: toolLabels,
+                datasets: [{
+                    label: 'Tool Calls',
+                    data: toolValues,
+                    backgroundColor: 'rgba(59, 130, 246, 0.5)',
+                    borderColor: 'rgba(59, 130, 246, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: false
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+        
+        // Initialize user activity chart
+        const userActivityCtx = document.getElementById('userActivityChart').getContext('2d');
+        const userLabels = userMetrics.map(u => u.userId.substring(0, 15) + (u.userId.length > 15 ? '...' : ''));
+        const userRequests = userMetrics.map(u => u.totalRequests);
+        const userToolCalls = userMetrics.map(u => u.totalToolCalls);
+        
+        new Chart(userActivityCtx, {
+            type: 'bar',
+            data: {
+                labels: userLabels,
+                datasets: [
+                    {
+                        label: 'Requests',
+                        data: userRequests,
+                        backgroundColor: 'rgba(99, 102, 241, 0.5)',
+                        borderColor: 'rgba(99, 102, 241, 1)',
+                        borderWidth: 1
+                    },
+                    {
+                        label: 'Tool Calls',
+                        data: userToolCalls,
+                        backgroundColor: 'rgba(34, 197, 94, 0.5)',
+                        borderColor: 'rgba(34, 197, 94, 1)',
+                        borderWidth: 1
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'top',
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+        
+        // Auto-refresh every 10 seconds
+        setTimeout(() => {
+            window.location.reload();
+        }, 10000);
+    </script>
+</body>
+</html>
