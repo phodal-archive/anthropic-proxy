@@ -22,6 +22,7 @@ public class TurnLog {
     private String model;
     private boolean stream;
     private int toolsOfferedCount;  // tools available in the request
+    private String lastUserMessage;  // full user's message (may be large)
     private String lastUserMessagePreview;  // truncated preview of user's message
     private int promptTokens;
     private int completionTokens;

@@ -139,6 +139,7 @@ public class MetricsService {
                 .model(request.getModel())
                 .stream(Boolean.TRUE.equals(request.getStream()))
                 .toolsOfferedCount(request.getTools() != null ? request.getTools().size() : 0)
+                .lastUserMessage(lastUserMessage != null ? lastUserMessage.trim() : "")
                 .lastUserMessagePreview(TurnLog.createMessagePreview(lastUserMessage, MESSAGE_PREVIEW_LENGTH))
                 .build();
         

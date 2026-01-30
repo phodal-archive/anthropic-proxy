@@ -151,7 +151,7 @@ public class MetricsDashboardController {
         if (turn == null) {
             return Map.of("error", "Turn not found");
         }
-        return turnLogToMap(turn);
+        return turnLogToDetailMap(turn);
     }
     
     /**
@@ -206,6 +206,12 @@ public class MetricsDashboardController {
                     .collect(Collectors.toList()));
         }
         
+        return map;
+    }
+
+    private Map<String, Object> turnLogToDetailMap(TurnLog turn) {
+        Map<String, Object> map = turnLogToMap(turn);
+        map.put("lastUserMessage", turn.getLastUserMessage());
         return map;
     }
     

@@ -297,7 +297,7 @@
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${formatTime(turn.timestamp)}</td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">${truncate(turn.userId, 15)}</td>
                     <td class="px-4 py-3 text-sm text-gray-500 max-w-xs">
-                        <div class="message-preview-cell" data-full-message="${escapeHtml(turn.lastUserMessagePreview || '')}">${escapeHtml(truncate(turn.lastUserMessagePreview || '-', 50))}</div>
+                        <div class="message-preview-cell" data-turn-id="${turn.turnId}" data-preview-message="${escapeHtml(turn.lastUserMessagePreview || '')}">${escapeHtml(truncate(turn.lastUserMessagePreview || '-', 50))}</div>
                     </td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">${turn.model || '-'}</td>
                     <td class="px-4 py-3 whitespace-nowrap text-sm">
@@ -545,13 +545,51 @@
             // Create tooltip element
             const $tooltip = $('<div class="message-full-tooltip"></div>').appendTo('body');
 
+            // Cache full messages by turnId (avoid refetching)
+            const fullMessageCache = new Map();
+
             // Handle hover on message preview cells
             $(document).on('mouseenter', '.message-preview-cell', function(e) {
-                const fullMessage = $(this).data('full-message');
-                if (fullMessage && fullMessage !== '-') {
-                    $tooltip.text(fullMessage).show();
+                const $cell = $(this);
+                const turnId = $cell.data('turn-id');
+                const previewMessage = $cell.data('preview-message');
+
+                if (!turnId) {
+                    if (previewMessage && previewMessage !== '-') {
+                        $tooltip.text(previewMessage).show();
+                        positionTooltip(e);
+                    }
+                    return;
+                }
+
+                const cached = fullMessageCache.get(turnId);
+                if (cached) {
+                    $tooltip.text(cached).show();
+                    positionTooltip(e);
+                    return;
+                }
+
+                // Show immediately (preview) while fetching full message
+                if (previewMessage && previewMessage !== '-') {
+                    $tooltip.text(previewMessage).show();
                     positionTooltip(e);
                 }
+
+                fetch(`/metrics/api/turns/${encodeURIComponent(turnId)}`)
+                    .then(r => r.json())
+                    .then(data => {
+                        const full = (data && data.lastUserMessage) ? String(data.lastUserMessage) : null;
+                        if (full && full.trim().length > 0) {
+                            fullMessageCache.set(turnId, full);
+                            // Only update tooltip if still hovering this cell
+                            if ($cell.is(':hover')) {
+                                $tooltip.text(full).show();
+                            }
+                        }
+                    })
+                    .catch(() => {
+                        // ignore; keep preview
+                    });
             });
 
             $(document).on('mousemove', '.message-preview-cell', function(e) {
